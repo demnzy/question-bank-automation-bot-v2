@@ -72,7 +72,7 @@ def process_pdf(pdf_path):
             
             if ocr_text:
                 # Mark it as visual content
-                formatted_text = f"[VISUAL START]\n{ocr_text}\n[VISUAL END]"
+                formatted = f"\n[VISUAL START]\n{ocr_text}\n[VISUAL END]\n"
                 page_items.append({
                     "type": "ocr_image",
                     "content": formatted_text,
