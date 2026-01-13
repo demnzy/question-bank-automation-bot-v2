@@ -1,0 +1,45 @@
+name: V2 Exam Transformation
+
+on:
+  repository_dispatch:
+    types: [start-processing]
+
+jobs:
+  transform:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Download Input Excel
+        run: |
+          # Download the Enriched Excel from n8n payload
+          echo "Downloading file from: ${{ github.event.client_payload.excel_url }}"
+          curl -L "${{ github.event.client_payload.excel_url }}" -o input.xlsx
+
+      - name: Run Universal Miner
+        run: |
+          # --- UPDATED TO USE YOUR NEW SCRIPT NAME ---
+          python universal_miner.py --input input.xlsx --output output_v2.xlsx --collection "${{ github.event.client_payload.collection_name }}"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: transformed-v2-data
+          path: output_v2.xlsx
+
+      # OPTIONAL: Add a step here to POST the result back to n8n if needed
+      # - name: Notify n8n
+      #   run: ...
