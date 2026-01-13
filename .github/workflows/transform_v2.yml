@@ -39,7 +39,14 @@ jobs:
         with:
           name: transformed-v2-data
           path: output_v2.xlsx
-
+          
+      - name: Send Result to n8n
+        run: |
+          echo "Uploading output_v2.xlsx to n8n..."
+          curl -X POST "${{ github.event.client_payload.callback_url }}" \
+          -H "Content-Type: multipart/form-data" \
+          -F "data=@output_v2.xlsx" \
+          -F "folder_id=${{ github.event.client_payload.folder_id }}"
       # OPTIONAL: Add a step here to POST the result back to n8n if needed
       # - name: Notify n8n
       #   run: ...
