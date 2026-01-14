@@ -2,117 +2,167 @@ import pandas as pd
 import argparse
 import uuid
 import re
+import hashlib
 
-def generate_key(prefix):
+# --- HELPERS ---
+def generate_key(prefix, text_seed=None):
+    """Generates a deterministic or random key."""
+    if text_seed:
+        hash_object = hashlib.md5(str(text_seed).encode())
+        return f"{prefix}_{hash_object.hexdigest()[:8].upper()}"
     return f"{prefix}_{str(uuid.uuid4())[:8].upper()}"
 
-def process_drag_drop_options(options_text, correct_text):
-    """
-    Parses 'Item A; Item B' strings into a list of dictionaries for the Options table.
-    """
-    if pd.isna(options_text): return []
-    
-    # Split by semicolon or newline
-    opts = [x.strip() for x in re.split(r'[;\n]', str(options_text)) if x.strip()]
-    
-    # Try to determine correct order from Correct_Options
-    # This is a basic implementation; specific logic depends on how consistent the LLM is
-    correct_order_map = {}
-    if not pd.isna(correct_text):
-        correct_items = [x.strip() for x in re.split(r'[;\n]', str(correct_text)) if x.strip()]
-        for idx, item in enumerate(correct_items, 1):
-            correct_order_map[item] = idx
+def clean_text(text):
+    if pd.isna(text): return ""
+    return str(text).strip()
 
-    results = []
-    for i, opt in enumerate(opts, 1):
-        is_correct = opt in correct_order_map
-        correct_order = correct_order_map.get(opt, "")
-        results.append({
-            "Text": opt,
-            "IsCorrect": True, # For drag/drop, usually all items are 'correct' parts of the sequence
-            "OrderIndex": i,
-            "CorrectOrder": i # Assuming the target order matches the list for now
-        })
-    return results
+def parse_options_v2(question_key, q_type, options_str, correct_str):
+    """
+    Parses options string into V2 relational rows.
+    Handles Multiple Choice (A/B/C) AND Drag & Drop (Sequence).
+    """
+    options_rows = []
+    
+    # 1. Clean Inputs
+    raw_options = [x.strip() for x in re.split(r'[;\n]', clean_text(options_str)) if x.strip()]
+    raw_correct = [x.strip() for x in re.split(r'[;\n]', clean_text(correct_str)) if x.strip()]
+    
+    # 2. Logic Switch based on Type
+    is_sequence = q_type in ['drag_drop', 'sequence']
+    
+    # Create a lookup for correct answers
+    # For MC: Just checks existence. For DragDrop: Index matters.
+    correct_lookup = {opt: i+1 for i, opt in enumerate(raw_correct)}
 
+    for idx, opt_text in enumerate(raw_options, 1):
+        is_correct = False
+        correct_order = None
+        
+        # Check against correct list
+        # We try exact match first, then fuzzy match if needed (omitted for brevity)
+        if opt_text in correct_lookup:
+            is_correct = True
+            if is_sequence:
+                correct_order = correct_lookup[opt_text]
+        
+        row = {
+            "QuestionKey": question_key,
+            "Text": opt_text,
+            "IsCorrect": is_correct,
+            "OrderIndex": idx, # The order they appear in the question
+            "CorrectOrder": correct_order if is_sequence else None,
+            "HotspotCoords": None 
+        }
+        options_rows.append(row)
+        
+    return options_rows
+
+# --- MAIN SCRIPT ---
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input', required=True)
-    parser.add_argument('--output', required=True)
-    parser.add_argument('--collection', required=True)
+    parser.add_argument('--input', required=True, help="Input Enriched Excel")
+    parser.add_argument('--output', required=True, help="Output Final Excel")
+    parser.add_argument('--collection', required=True, help="Collection Name")
     args = parser.parse_args()
 
-    # Read Input
-    df = pd.read_excel(args.input)
+    # 1. Load Data
+    try:
+        df = pd.read_excel(args.input)
+    except Exception as e:
+        print(f"Error reading excel: {e}")
+        return
 
-    # Initialize Tables
-    questions_table = []
-    options_table = []
-    scenarios_table = []
-    scenario_map = {} # To deduplicate scenarios
+    # 2. Initialize V2 Containers
+    data_questions = []
+    data_options = []
+    data_scenarios = []
+    data_quizzes = []
+    data_collections = []
+    data_categories = []
+
+    # 3. Setup Metadata Keys
+    collection_key = generate_key("COL", args.collection)
+    category_key = "CAT_GENERIC" # Default
+    quiz_key = generate_key("QUIZ", args.collection + "_Batch1")
+
+    # Add Top Level Data (Collection/Quiz) - simplified for V2
+    data_collections.append({
+        "CollectionKey": collection_key, 
+        "Name": args.collection, 
+        "CategoryKey": category_key,
+        "IsPublic": True
+    })
+    
+    data_quizzes.append({
+        "QuizKey": quiz_key,
+        "Title": f"{args.collection} Practice",
+        "CollectionKey": collection_key,
+        "PassMark": 70,
+        "IsPublic": True
+    })
+
+    # 4. Processing Loop
+    scenario_tracker = {} # To deduplicate scenarios
 
     for index, row in df.iterrows():
-        # 1. Handle Scenario
+        # --- A. SCENARIOS ---
         scenario_key = None
-        scenario_text = row.get('Scenario')
+        scen_text = clean_text(row.get('Scenario'))
         
-        if pd.notna(scenario_text):
-            # Check if we've seen this scenario text before (simple dedup)
-            scen_hash = str(scenario_text)[:50] 
-            if scen_hash in scenario_map:
-                scenario_key = scenario_map[scen_hash]
+        if scen_text and len(scen_text) > 10: # Min length to be real
+            # Deduplicate based on content hash
+            scen_hash = hashlib.md5(scen_text.encode()).hexdigest()
+            
+            if scen_hash in scenario_tracker:
+                scenario_key = scenario_tracker[scen_hash]
             else:
-                scenario_key = generate_key("SCN")
-                scenario_map[scen_hash] = scenario_key
-                scenarios_table.append({
+                scenario_key = generate_key("SCN", scen_hash)
+                scenario_tracker[scen_hash] = scenario_key
+                
+                data_scenarios.append({
                     "ScenarioKey": scenario_key,
-                    "Title": f"Case Study {len(scenario_map)}",
-                    "Context": scenario_text,
-                    "MediaType": "text"
+                    "QuizKey": quiz_key,
+                    "Title": f"Case Study {len(scenario_tracker)}",
+                    "Context": scen_text,
+                    "Order": len(scenario_tracker)
                 })
 
-        # 2. Handle Question
-        q_key = generate_key("Q")
-        q_type = row.get('Question_Type', 'multiple_choice')
+        # --- B. QUESTIONS ---
+        q_key = generate_key("Q", f"{quiz_key}_{index}")
+        q_type = str(row.get('Question_Type', 'multiple_choice')).lower()
         
-        questions_table.append({
+        data_questions.append({
             "QuestionKey": q_key,
+            "QuizKey": quiz_key,
             "Type": q_type,
-            "Text": row.get('Question'),
-            "Explanation": row.get('Explanation'),
+            "Text": clean_text(row.get('Question')),
+            "Explanation": clean_text(row.get('Explanation')),
             "ScenarioKey": scenario_key,
-            "Order": index + 1
+            "Order": index + 1,
+            "Points": 1
         })
 
-        # 3. Handle Options (Complex Logic for Drag/Drop)
-        if q_type == 'drag_drop' or q_type == 'hotspot':
-            parsed_opts = process_drag_drop_options(row.get('Options'), row.get('Correct_Options'))
-            for opt in parsed_opts:
-                opt['QuestionKey'] = q_key
-                options_table.append(opt)
-        else:
-            # Standard Multiple Choice Parsing (Simplified for brevity)
-            raw_opts = str(row.get('Options', '')).split(';')
-            for i, opt_text in enumerate(raw_opts):
-                options_table.append({
-                    "QuestionKey": q_key,
-                    "Text": opt_text,
-                    "IsCorrect": False, # Needs logic to check against Correct_Options
-                    "OrderIndex": i + 1
-                })
+        # --- C. OPTIONS ---
+        # Call the parser to handle Drag/Drop vs MCQ logic
+        opts = parse_options_v2(
+            q_key, 
+            q_type, 
+            row.get('Options'), 
+            row.get('Correct_Options')
+        )
+        data_options.extend(opts)
 
-    # Convert to DataFrames
-    df_q = pd.DataFrame(questions_table)
-    df_o = pd.DataFrame(options_table)
-    df_s = pd.DataFrame(scenarios_table)
+    # 5. Export to Excel (Multi-Sheet)
+    with pd.ExcelWriter(args.output, engine='openpyxl') as writer:
+        pd.DataFrame(data_questions).to_excel(writer, sheet_name='Questions', index=False)
+        pd.DataFrame(data_options).to_excel(writer, sheet_name='Options', index=False)
+        pd.DataFrame(data_scenarios).to_excel(writer, sheet_name='Scenarios', index=False)
+        pd.DataFrame(data_quizzes).to_excel(writer, sheet_name='Quizzes', index=False)
+        pd.DataFrame(data_collections).to_excel(writer, sheet_name='Collections', index=False)
+        # pd.DataFrame(data_categories).to_excel(writer, sheet_name='Categories', index=False) 
 
-    # Save to Multi-sheet Excel
-    with pd.ExcelWriter(args.output) as writer:
-        df_q.to_excel(writer, sheet_name='Questions', index=False)
-        df_o.to_excel(writer, sheet_name='Options', index=False)
-        df_s.to_excel(writer, sheet_name='Scenarios', index=False)
-
-    print("Transformation V2 Complete.")
+    print(f"Successfully created V2 Export: {args.output}")
+    print(f"Questions: {len(data_questions)} | Scenarios: {len(data_scenarios)}")
 
 if __name__ == "__main__":
     main()
