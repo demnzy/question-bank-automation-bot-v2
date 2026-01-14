@@ -23,30 +23,46 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Download Input Excel
+      - name: Download Files from n8n
         run: |
-          # Download the Enriched Excel from n8n payload
-          echo "Downloading file from: ${{ github.event.client_payload.excel_url }}"
-          curl -L "${{ github.event.client_payload.excel_url }}" -o input.xlsx
-
-      - name: Run Universal Miner
-        run: |
-          # --- UPDATED TO USE YOUR NEW SCRIPT NAME ---
-          python universal_miner.py --input input.xlsx --output output_v2.xlsx --collection "${{ github.event.client_payload.collection_name }}"
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: transformed-v2-data
-          path: output_v2.xlsx
+          # 1. Clean filename
+          RAW_NAME="${{ github.event.client_payload.collection_name }}"
+          SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[^a-zA-Z0-9._-]//g')
+          if [ -z "$SAFE_NAME" ]; then SAFE_NAME="Exam_Export"; fi
           
+          echo "EXAM_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          
+          # 2. Download Excel and PDF (PDF for future image mining)
+          curl -L "${{ github.event.client_payload.excel_url }}" -o "${SAFE_NAME}.xlsx"
+          curl -L "${{ github.event.client_payload.pdf_url }}" -o "${SAFE_NAME}.pdf"
+
+      # --- PLACEHOLDER: IMAGE MINER (Enable later) ---
+      # - name: Run Image Miner
+      #   run: python image_miner_v2.py ...
+
+      - name: Run V2 Transformer
+        run: |
+          # Define Output Name
+          FINAL_NAME="${{ env.EXAM_NAME }}_Final.xlsx"
+          
+          # Run the Universal Miner
+          python universal_miner.py \
+            --input "${{ env.EXAM_NAME }}.xlsx" \
+            --output "$FINAL_NAME" \
+            --collection "${{ env.EXAM_NAME }}"
+            
+          echo "FINAL_FILE=$FINAL_NAME" >> $GITHUB_ENV
+
       - name: Send Result to n8n
         run: |
-          echo "Uploading output_v2.xlsx to n8n..."
-          curl -X POST "${{ github.event.client_payload.callback_url }}" \
+          echo "Uploading ${{ env.FINAL_FILE }} back to n8n..."
+          
+          # Force HTTPS to prevent redirect issues
+          CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+          
+          curl -X POST "$CALLBACK_URL" \
           -H "Content-Type: multipart/form-data" \
-          -F "data=@output_v2.xlsx" \
-          -F "folder_id=${{ github.event.client_payload.folder_id }}"
-      # OPTIONAL: Add a step here to POST the result back to n8n if needed
-      # - name: Notify n8n
-      #   run: ...
+          -F "data=@${{ env.FINAL_FILE }}" \
+          -F "fileName=${{ env.FINAL_FILE }}" \
+          -F "folder_id=${{ github.event.client_payload.folder_id }}" \
+          -F "user_email=${{ github.event.client_payload.user_email }}"
