@@ -1,4 +1,9 @@
 pandas
 openpyxl
+pymupdf
+cloudscraper
 requests
-argparse
+pytesseract
+Pillow
+fuzzywuzzy
+python-Levenshtein
