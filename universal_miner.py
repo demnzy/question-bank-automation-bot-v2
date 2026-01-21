@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-universal_miner.py (V2.1 - Hotspot Metadata Schema)
+universal_miner.py (V2.1 - Hotspot Metadata Support)
 
 Updates:
+- Questions Table: Added 'Variant' column.
 - Options Table: Replaced 'HotspotCoords' with 'Metadata' (JSON).
-- Added logic to infer Hotspot Variants (yes_no_matrix, click_region, dropdown).
-- Preserves standard V1/V2 functionality.
+- Logic: Infer Hotspot Variants (yes_no_matrix, click_region, dropdown).
 """
 
 import argparse
@@ -15,7 +15,7 @@ import pandas as pd
 import uuid
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Set, Any
+from typing import Dict, List, Any
 
 # --- CONFIGURATION ---
 DEFAULT_CATEGORY_NAME = "IT & Technology"
@@ -72,7 +72,7 @@ KEYWORD_TAG_MAP = {
     r"\bblob\b|\bstorage account\b": "storage", r"\bcosmos db\b": "cosmosdb", r"\bsql\b": "sql",
     r"\bvirtual machine\b|\bvm\b": "compute", r"\baks\b|\bkubernetes\b": "containers",
     r"\bvnet\b|\bnsg\b": "networking", r"\bmonitor\b": "monitoring", r"\bsentinel\b": "sentinel",
-    r"\bpower bi\b": "power-bi", r"\bdax\b": "dax"
+    r"\bpower bi\b": "power-bi", r"\bdax\b": "dax", r"\bdata modeling\b": "data-modeling"
 }
 
 def infer_tags(text_content: str, title: str) -> str:
@@ -85,38 +85,25 @@ def infer_tags(text_content: str, title: str) -> str:
         if re.search(pat, content): tags.add(tag)
     return ",".join(list(tags)[:8]) 
 
-# --------------------- HOTSPOT METADATA GENERATOR ---------------------
+# --------------------- HOTSPOT LOGIC ---------------------
 
-def generate_hotspot_metadata(q_type, opt_text, is_correct):
-    """
-    Constructs the specific JSON Metadata required for the new Hotspot Schema.
-    """
-    if q_type != 'hotspot':
-        return None
+def detect_hotspot_variant(q_text, options_str):
+    """Determines if a hotspot is Click, Yes/No, or Dropdown."""
+    q_lower = q_text.lower()
+    opt_lower = options_str.lower()
+    
+    if "[slot" in q_lower or "[slot" in opt_lower:
+        return "dropdown"
+    
+    if "select yes" in q_lower or "true or false" in q_lower:
+        return "yes_no_matrix"
+    
+    # Default to Click Region (Image Map)
+    return "click_region"
 
-    # Heuristic 1: Yes/No Matrix
-    # If option text is simple True/False/Yes/No, treat as matrix
-    clean_opt = opt_text.lower().strip()
-    if clean_opt in ['yes', 'no', 'true', 'false']:
-        # For matrix questions, the 'Text' is usually the statement, but if LLM puts 'Yes' in options...
-        # We assume the standard case: The Text is the statement, and Correctness implies Yes/No
-        return json.dumps({
-            "variant": "yes_no_matrix",
-            "correctValue": "yes" if is_correct else "no" 
-        })
+# --------------------- PARSERS ---------------------
 
-    # Heuristic 2: Click Region (Default)
-    # Since we lack coords from PDF, we provide a valid JSON with null coords
-    # This allows the import to succeed, but user must draw region in UI.
-    return json.dumps({
-        "variant": "click_region",
-        "shape": "rect", # Default shape
-        "coords": {"x": 0, "y": 0, "width": 0, "height": 0} # Placeholder
-    })
-
-# --------------------- OPTION PARSER ---------------------
-
-def parse_options_v2(question_key, q_type, options_str, correct_str):
+def parse_options_v2(question_key, q_type, variant, options_str, correct_str):
     options_rows = []
     
     options_str = clean_text(options_str)
@@ -124,11 +111,7 @@ def parse_options_v2(question_key, q_type, options_str, correct_str):
     
     if not options_str: return []
 
-    # Detect if this is a "Yes/No" style question based on options text
-    # Used to switch metadata generation logic
-    is_yes_no = any(x in options_str.lower() for x in ['yes', 'no', 'true', 'false'])
-
-    # Split Options
+    # Regex to split "A) Text"
     if re.search(r"\b[A-Za-z]\)", options_str):
         raw_options = re.split(r";\s*(?=[A-Za-z]\))", options_str)
     else:
@@ -136,11 +119,10 @@ def parse_options_v2(question_key, q_type, options_str, correct_str):
 
     correct_letters = set(re.findall(r"\b([A-Za-z])\)", correct_str))
     
-    is_sequence = q_type in ['drag_drop', 'sequence']
-    
     for idx, opt_raw in enumerate(raw_options, 1):
         opt_text = opt_raw.strip()
         
+        # Strip Letter Prefix
         match = re.match(r"^([A-Za-z])\)\s*(.*)", opt_text)
         if match:
             letter = match.group(1).upper()
@@ -150,36 +132,46 @@ def parse_options_v2(question_key, q_type, options_str, correct_str):
             text_body = opt_text
         
         is_correct = False
-        correct_order = None
         
-        if is_sequence:
-            if text_body in correct_str:
-                is_correct = True
-                correct_order = idx 
+        # Correctness Logic
+        if q_type == 'drag_drop':
+            # For sequence, if it exists in correct string, it's a valid item
+            if text_body in correct_str: is_correct = True
         else:
-            if letter in correct_letters:
-                is_correct = True
-            elif text_body in correct_str and len(text_body) > 2:
-                is_correct = True
+            # For MCQ/Hotspot
+            if letter in correct_letters: is_correct = True
+            elif text_body in correct_str and len(text_body) > 1: is_correct = True
 
         # --- METADATA GENERATION ---
         metadata_json = None
+        
         if q_type == 'hotspot':
-            if is_yes_no:
-                # If it's a matrix, the text body is the statement. 
-                # Use is_correct to determine if the answer should be Yes or No.
+            if variant == 'yes_no_matrix':
+                # For Matrix: Text is the statement. Correctness = Yes/No.
                 metadata_json = json.dumps({
                     "variant": "yes_no_matrix",
                     "correctValue": "yes" if is_correct else "no"
                 })
-                # For matrix, the row itself is always "Correct" in terms of existing in the DB
-                is_correct = True 
+                is_correct = True # Row must exist
+                
+            elif variant == 'dropdown':
+                # Special parsing for Dropdown: "A) [SLOT1] Label | Choice1, Choice2"
+                # If pure text, we default to basic structure
+                metadata_json = json.dumps({
+                    "slotId": f"SLOT{idx}",
+                    "label": f"Option {idx}",
+                    "choices": [text_body], # In a real scenario, we'd extract distractors
+                    "correctChoice": text_body
+                })
+                is_correct = True
+                
             else:
-                # Default to Click Region
+                # Default: Click Region
+                # We put dummy coords so it imports. User draws box in UI.
                 metadata_json = json.dumps({
                     "variant": "click_region",
                     "shape": "rect",
-                    "coords": {"x": 10, "y": 10, "width": 20, "height": 20} # Dummy coords
+                    "coords": {"x": 10, "y": 10 + (idx*10), "width": 50, "height": 50}
                 })
 
         row = {
@@ -187,14 +179,14 @@ def parse_options_v2(question_key, q_type, options_str, correct_str):
             "Text": text_body,
             "IsCorrect": is_correct,
             "OrderIndex": idx,
-            "CorrectOrder": correct_order if is_sequence else None,
-            "Metadata": metadata_json # <--- NEW FIELD
+            "CorrectOrder": idx if q_type == 'drag_drop' else None,
+            "Metadata": metadata_json
         }
         options_rows.append(row)
         
     return options_rows
 
-# --------------------- MAIN PROCESSING ---------------------
+# --------------------- MAIN ---------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -253,7 +245,12 @@ def main():
         quiz_counters[quiz_key] += 1
         q_key = f"Q-{quiz_key}-{quiz_counters[quiz_key]:03d}"
         q_type = clean_text(row.get('Question_Type', 'multiple_choice')).lower()
-
+        
+        # --- NEW: DETERMINE VARIANT ---
+        q_variant = None
+        if q_type == 'hotspot':
+            q_variant = detect_hotspot_variant(str(row.get('Question')), str(row.get('Options')))
+        
         # Scenario
         scenario_key = None
         scen_text = clean_text(row.get('Scenario'))
@@ -276,7 +273,9 @@ def main():
         elif str(row.get('has_image')).lower() in ['true', '1', 'yes']: media_val = "1"
 
         tbl_questions.append({
-            "QuestionKey": q_key, "QuizKey": quiz_key, "Type": q_type, "Text": q_text,
+            "QuestionKey": q_key, "QuizKey": quiz_key, "Type": q_type, 
+            "Variant": q_variant, # <--- NEW COLUMN
+            "Text": q_text,
             "Explanation": clean_text(row.get('Explanation')), "Points": DEFAULT_POINTS,
             "Order": quiz_counters[quiz_key], "ScenarioKey": scenario_key, "ScenarioOrder": 1 if scenario_key else None,
             "CorrectAnswer": clean_text(row.get('Correct_Options')), "PartialScoring": q_type in ['multiple_answer', 'drag_drop'],
@@ -284,7 +283,7 @@ def main():
         })
 
         # Options Parsing
-        opt_rows = parse_options_v2(q_key, q_type, row.get('Options'), row.get('Correct_Options'))
+        opt_rows = parse_options_v2(q_key, q_type, q_variant, row.get('Options'), row.get('Correct_Options'))
         tbl_options.extend(opt_rows)
 
         # Hints
@@ -301,7 +300,7 @@ def main():
         pd.DataFrame(tbl_options).to_excel(writer, "Options", index=False)
         pd.DataFrame(tbl_hints).to_excel(writer, "Hints", index=False)
 
-    print(f"V2 Transformation Complete: {len(tbl_questions)} questions processed.")
+    print(f"V2.1 Transformation Complete: {len(tbl_questions)} questions processed.")
 
 if __name__ == "__main__":
     main()
