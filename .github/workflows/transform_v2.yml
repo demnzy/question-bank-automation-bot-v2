@@ -1,16 +1,17 @@
-name: V2 Exam Transformation
+name: V2 Exam Automation
 
 on:
   repository_dispatch:
     types: [start-processing]
 
 jobs:
-  transform:
+  process-exam:
     runs-on: ubuntu-latest
     permissions:
       contents: write
       
     steps:
+      # --- 1. SETUP ENVIRONMENT ---
       - name: Checkout Code
         uses: actions/checkout@v3
 
@@ -19,50 +20,72 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Install Dependencies
+      # CRITICAL: Install Tesseract for the "OCR Rescue" feature
+      - name: Install System Dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
           pip install -r requirements.txt
 
-      - name: Download Files from n8n
+      # --- 2. DOWNLOAD INPUTS FROM N8N ---
+      - name: Download Files
         run: |
-          # 1. Clean filename
+          # Sanitize Exam Name
           RAW_NAME="${{ github.event.client_payload.collection_name }}"
           SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[^a-zA-Z0-9._-]//g')
           if [ -z "$SAFE_NAME" ]; then SAFE_NAME="Exam_Export"; fi
           
           echo "EXAM_NAME=$SAFE_NAME" >> $GITHUB_ENV
           
-          # 2. Download Excel and PDF (PDF for future image mining)
+          # Download Excel & PDF
           curl -L "${{ github.event.client_payload.excel_url }}" -o "${SAFE_NAME}.xlsx"
           curl -L "${{ github.event.client_payload.pdf_url }}" -o "${SAFE_NAME}.pdf"
-
-      # --- PLACEHOLDER: IMAGE MINER (Enable later) ---
-      # - name: Run Image Miner
-      #   run: python image_miner_v2.py ...
-
-      - name: Run V2 Transformer
-        run: |
-          # Define Output Name
-          FINAL_NAME="${{ env.EXAM_NAME }}_Final.xlsx"
           
-          # Run the Universal Miner
+          # Save the Coordinate Map from n8n (for V2 precision)
+          # If payload is empty (V1 mode), write empty JSON
+          COORD_JSON='${{ github.event.client_payload.image_lookup_json }}'
+          if [ -z "$COORD_JSON" ]; then
+             echo "{}" > coords.json
+          else
+             echo "$COORD_JSON" > coords.json
+          fi
+
+      # --- 3. RUN UNIVERSAL IMAGE MINER ---
+      - name: Run Image Miner
+        env:
+          SUCCEED_EMAIL: ${{ secrets.SUCCEED_EMAIL }}
+          SUCCEED_PASSWORD: ${{ secrets.SUCCEED_PASSWORD }}
+        run: |
+          # Usage: script.py <excel> <pdf> <coords_in> <url_map_out>
+          python universal_image_miner.py \
+            "${{ env.EXAM_NAME }}.xlsx" \
+            "${{ env.EXAM_NAME }}.pdf" \
+            coords.json \
+            url_map.json
+
+      # --- 4. RUN UNIVERSAL TRANSFORMER ---
+      - name: Run Data Transformer
+        run: |
+          # Usage: script.py --input <excel> --output <final_excel> --lookup <url_map>
+          FINAL_FILE="${{ env.EXAM_NAME }}_Final.xlsx"
+          
           python universal_miner.py \
             --input "${{ env.EXAM_NAME }}.xlsx" \
-            --output "$FINAL_NAME" \
+            --output "$FINAL_FILE" \
+            --lookup url_map.json \
             --collection "${{ env.EXAM_NAME }}"
             
-          echo "FINAL_FILE=$FINAL_NAME" >> $GITHUB_ENV
+          echo "FINAL_FILE=$FINAL_FILE" >> $GITHUB_ENV
 
+      # --- 5. UPLOAD RESULT TO N8N ---
       - name: Send Result to n8n
         run: |
-          echo "Uploading ${{ env.FINAL_FILE }} back to n8n..."
-          
-          # Force HTTPS to prevent redirect issues
           CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+          
+          echo "Uploading ${{ env.FINAL_FILE }}..."
           
           curl -X POST "$CALLBACK_URL" \
           -H "Content-Type: multipart/form-data" \
-          -F "data=@${{ env.FINAL_FILE }}" \
-          -F "fileName=${{ env.FINAL_FILE }}" \
+          -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
           -F "folder_id=${{ github.event.client_payload.folder_id }}" \
           -F "user_email=${{ github.event.client_payload.user_email }}"
