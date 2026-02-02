@@ -42,12 +42,31 @@ jobs:
           curl -L "${{ github.event.client_payload.pdf_url }}" -o "${SAFE_NAME}.pdf"
           
           # Save the Coordinate Map from n8n (for V2 precision)
-          # If payload is empty (V1 mode), write empty JSON
           COORD_JSON='${{ github.event.client_payload.image_lookup_json }}'
           if [ -z "$COORD_JSON" ]; then
              echo "{}" > coords.json
           else
              echo "$COORD_JSON" > coords.json
+          fi
+
+      # --- 2b. DEBUG SECRETS (SAFE CHECK) ---
+      - name: Verify Secrets Exist
+        env:
+          EMAIL_CHECK: ${{ secrets.SUCCEED_EMAIL }}
+          PASS_CHECK: ${{ secrets.SUCCEED_PASSWORD }}
+        run: |
+          if [ -z "$EMAIL_CHECK" ]; then
+            echo "❌ ERROR: SUCCEED_EMAIL secret is MISSING or EMPTY."
+            exit 1
+          else
+            echo "✅ SUCCEED_EMAIL is present."
+          fi
+          
+          if [ -z "$PASS_CHECK" ]; then
+            echo "❌ ERROR: SUCCEED_PASSWORD secret is MISSING or EMPTY."
+            exit 1
+          else
+            echo "✅ SUCCEED_PASSWORD is present."
           fi
 
       # --- 3. RUN UNIVERSAL IMAGE MINER ---
