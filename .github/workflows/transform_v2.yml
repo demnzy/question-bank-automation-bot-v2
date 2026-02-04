@@ -128,14 +128,31 @@ jobs:
               exit 1
           fi
 
-      # --- 5. UPLOAD RESULT TO N8N ---
+# --- 5. UPLOAD RESULT TO N8N (FIXED) ---
       - name: Send Result to n8n
         run: |
-          CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
-          echo "Uploading ${{ env.FINAL_FILE }} to $CALLBACK_URL..."
+          RAW_URL="${{ github.event.client_payload.callback_url }}"
           
-          curl -X POST "$CALLBACK_URL" \
-          -H "Content-Type: multipart/form-data" \
-          -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
-          -F "folder_id=${{ github.event.client_payload.folder_id }}" \
-          -F "user_email=${{ github.event.client_payload.user_email }}"
+          # FIX 1: Force HTTPS if missing
+          if [[ "$RAW_URL" != http* ]]; then
+             CALLBACK_URL="https://$RAW_URL"
+          else
+             CALLBACK_URL="$RAW_URL"
+          fi
+          
+          echo "Target URL: $CALLBACK_URL"
+          
+          if [ -f "${{ env.FINAL_FILE }}" ]; then
+             echo "✅ Found file: ${{ env.FINAL_FILE }}"
+             echo "Uploading..."
+             
+             # FIX 2: Added -L to follow redirects automatically
+             curl -L -X POST "$CALLBACK_URL" \
+             -H "Content-Type: multipart/form-data" \
+             -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
+             -F "folder_id=${{ github.event.client_payload.folder_id }}" \
+             -F "user_email=${{ github.event.client_payload.user_email }}"
+          else
+             echo "❌ CRITICAL ERROR: Output file '${{ env.FINAL_FILE }}' was NOT created."
+             exit 1
+          fi
