@@ -20,14 +20,13 @@ jobs:
         with:
           python-version: '3.9'
 
-      # CRITICAL: Install Tesseract for the "OCR Rescue" feature
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr
           pip install -r requirements.txt
 
-      # --- 2. DOWNLOAD INPUTS FROM N8N (FIXED) ---
+      # --- 2. DOWNLOAD INPUTS (FIXED) ---
       - name: Download Files
         run: |
           # Sanitize Exam Name
@@ -37,20 +36,20 @@ jobs:
           
           echo "EXAM_NAME=$SAFE_NAME" >> $GITHUB_ENV
           
-          # 1. Always Download Excel
+          # 1. Download Excel
           echo "Downloading Excel..."
           curl -L "${{ github.event.client_payload.excel_url }}" -o "${SAFE_NAME}.xlsx"
           
-          # 2. Conditionally Download PDF (The Fix)
+          # 2. Check PDF URL
           PDF_URL="${{ github.event.client_payload.pdf_url }}"
           
           if [ -n "$PDF_URL" ] && [ "$PDF_URL" != "null" ]; then
              echo "Downloading PDF from $PDF_URL..."
              curl -L "$PDF_URL" -o "${SAFE_NAME}.pdf"
+             echo "HAS_PDF=true" >> $GITHUB_ENV
           else
-             echo "⚠️ No PDF URL provided. Creating dummy placeholder."
-             # Create an empty file so the python script doesn't crash on 'File Not Found'
-             touch "${SAFE_NAME}.pdf"
+             echo "⚠️ No PDF URL provided. Skipping PDF download."
+             echo "HAS_PDF=false" >> $GITHUB_ENV
           fi
           
           # 3. Save Coordinate Map
@@ -61,45 +60,41 @@ jobs:
              echo "$COORD_JSON" > coords.json
           fi
 
-      # --- 2b. DEBUG SECRETS (SAFE CHECK) ---
+      # --- 2b. DEBUG SECRETS ---
       - name: Verify Secrets Exist
         env:
           EMAIL_CHECK: ${{ secrets.SUCCEED_EMAIL }}
           PASS_CHECK: ${{ secrets.SUCCEED_PASSWORD }}
         run: |
           if [ -z "$EMAIL_CHECK" ]; then
-            echo "❌ ERROR: SUCCEED_EMAIL secret is MISSING or EMPTY."
+            echo "❌ ERROR: SUCCEED_EMAIL secret is MISSING."
             exit 1
-          else
-            echo "✅ SUCCEED_EMAIL is present."
-          fi
-          
-          if [ -z "$PASS_CHECK" ]; then
-            echo "❌ ERROR: SUCCEED_PASSWORD secret is MISSING or EMPTY."
-            exit 1
-          else
-            echo "✅ SUCCEED_PASSWORD is present."
           fi
 
-      # --- 3. RUN UNIVERSAL IMAGE MINER ---
+      # --- 3. RUN UNIVERSAL IMAGE MINER (CONDITIONAL) ---
       - name: Run Image Miner
         env:
           SUCCEED_EMAIL: ${{ secrets.SUCCEED_EMAIL }}
           SUCCEED_PASSWORD: ${{ secrets.SUCCEED_PASSWORD }}
         run: |
-          # Usage: script.py <excel> <pdf> <coords_in> <url_map_out>
-          python universal_image_miner.py \
-            "${{ env.EXAM_NAME }}.xlsx" \
-            "${{ env.EXAM_NAME }}.pdf" \
-            coords.json \
-            url_map.json
+          if [ "${{ env.HAS_PDF }}" == "true" ]; then
+             echo "✅ PDF Found. Running Image Miner..."
+             python universal_image_miner.py \
+               "${{ env.EXAM_NAME }}.xlsx" \
+               "${{ env.EXAM_NAME }}.pdf" \
+               coords.json \
+               url_map.json
+          else
+             echo "⚠️ No PDF. Skipping Image Miner and creating empty url_map."
+             echo "{}" > url_map.json
+          fi
 
       # --- 4. RUN UNIVERSAL TRANSFORMER ---
       - name: Run Data Transformer
         run: |
-          # Usage: script.py --input <excel> --output <final_excel> --lookup <url_map>
           FINAL_FILE="${{ env.EXAM_NAME }}_Final.xlsx"
           
+          echo "🚀 Starting Data Transformer..."
           python universal_miner.py \
             --input "${{ env.EXAM_NAME }}.xlsx" \
             --output "$FINAL_FILE" \
@@ -107,16 +102,25 @@ jobs:
             --collection "${{ env.EXAM_NAME }}"
             
           echo "FINAL_FILE=$FINAL_FILE" >> $GITHUB_ENV
+          
+          # DEBUG: List files to prove it exists
+          ls -la
 
       # --- 5. UPLOAD RESULT TO N8N ---
       - name: Send Result to n8n
         run: |
           CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
           
-          echo "Uploading ${{ env.FINAL_FILE }}..."
-          
-          curl -X POST "$CALLBACK_URL" \
-          -H "Content-Type: multipart/form-data" \
-          -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
-          -F "folder_id=${{ github.event.client_payload.folder_id }}" \
-          -F "user_email=${{ github.event.client_payload.user_email }}"
+          if [ -f "${{ env.FINAL_FILE }}" ]; then
+             echo "✅ Found file: ${{ env.FINAL_FILE }}"
+             echo "Uploading to $CALLBACK_URL..."
+             
+             curl -X POST "$CALLBACK_URL" \
+             -H "Content-Type: multipart/form-data" \
+             -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
+             -F "folder_id=${{ github.event.client_payload.folder_id }}" \
+             -F "user_email=${{ github.event.client_payload.user_email }}"
+          else
+             echo "❌ CRITICAL ERROR: Output file '${{ env.FINAL_FILE }}' was NOT created."
+             exit 1
+          fi
