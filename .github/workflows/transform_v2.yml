@@ -27,7 +27,7 @@ jobs:
           sudo apt-get install -y tesseract-ocr
           pip install -r requirements.txt
 
-      # --- 2. DOWNLOAD INPUTS FROM N8N ---
+      # --- 2. DOWNLOAD INPUTS FROM N8N (FIXED) ---
       - name: Download Files
         run: |
           # Sanitize Exam Name
@@ -37,11 +37,23 @@ jobs:
           
           echo "EXAM_NAME=$SAFE_NAME" >> $GITHUB_ENV
           
-          # Download Excel & PDF
+          # 1. Always Download Excel
+          echo "Downloading Excel..."
           curl -L "${{ github.event.client_payload.excel_url }}" -o "${SAFE_NAME}.xlsx"
-          curl -L "${{ github.event.client_payload.pdf_url }}" -o "${SAFE_NAME}.pdf"
           
-          # Save the Coordinate Map from n8n (for V2 precision)
+          # 2. Conditionally Download PDF (The Fix)
+          PDF_URL="${{ github.event.client_payload.pdf_url }}"
+          
+          if [ -n "$PDF_URL" ] && [ "$PDF_URL" != "null" ]; then
+             echo "Downloading PDF from $PDF_URL..."
+             curl -L "$PDF_URL" -o "${SAFE_NAME}.pdf"
+          else
+             echo "⚠️ No PDF URL provided. Creating dummy placeholder."
+             # Create an empty file so the python script doesn't crash on 'File Not Found'
+             touch "${SAFE_NAME}.pdf"
+          fi
+          
+          # 3. Save Coordinate Map
           COORD_JSON='${{ github.event.client_payload.image_lookup_json }}'
           if [ -z "$COORD_JSON" ]; then
              echo "{}" > coords.json
