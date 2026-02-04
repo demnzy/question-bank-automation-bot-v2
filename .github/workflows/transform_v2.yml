@@ -20,13 +20,16 @@ jobs:
         with:
           python-version: '3.9'
 
+      # CRITICAL FIX: Explicitly install openpyxl to prevent "engine" errors
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr
-          pip install -r requirements.txt
+          pip install --upgrade pip
+          pip install pandas openpyxl requests
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # --- 2. DOWNLOAD INPUTS (FIXED) ---
+      # --- 2. DOWNLOAD INPUTS (ROBUST) ---
       - name: Download Files
         run: |
           # Sanitize Exam Name
@@ -40,10 +43,10 @@ jobs:
           echo "Downloading Excel..."
           curl -L "${{ github.event.client_payload.excel_url }}" -o "${SAFE_NAME}.xlsx"
           
-          # 2. Check PDF URL
+          # 2. Check PDF URL (Fixes Curl Crash)
           PDF_URL="${{ github.event.client_payload.pdf_url }}"
           
-          if [ -n "$PDF_URL" ] && [ "$PDF_URL" != "null" ]; then
+          if [ -n "$PDF_URL" ] && [ "$PDF_URL" != "null" ] && [ "$PDF_URL" != "" ]; then
              echo "Downloading PDF from $PDF_URL..."
              curl -L "$PDF_URL" -o "${SAFE_NAME}.pdf"
              echo "HAS_PDF=true" >> $GITHUB_ENV
