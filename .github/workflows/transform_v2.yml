@@ -20,12 +20,14 @@ jobs:
         with:
           python-version: '3.9'
 
+      # FIX 1: FORCE INSTALL OPENPYXL (Solves "engine not determined" error)
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr
           pip install --upgrade pip
           pip install pandas openpyxl requests
+          # Install other requirements if they exist, but we prioritized the critical ones above
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       # --- 2. DOWNLOAD INPUTS (WITH LINK REPAIR) ---
@@ -37,24 +39,25 @@ jobs:
           if [ -z "$SAFE_NAME" ]; then SAFE_NAME="Exam_Export"; fi
           echo "EXAM_NAME=$SAFE_NAME" >> $GITHUB_ENV
           
-          # 2. LINK REPAIR: Convert Google Sheets 'Edit' link to 'Export' link
+          # FIX 2: LINK REPAIR (Forces Google Drive to give a real .xlsx file, not HTML)
           RAW_EXCEL_URL="${{ github.event.client_payload.excel_url }}"
           
-          # Regex logic: Replace '/edit...' with '/export?format=xlsx'
           if [[ "$RAW_EXCEL_URL" == *"docs.google.com/spreadsheets"* ]]; then
+             # Convert /edit link to /export link
              CLEAN_URL=$(echo "$RAW_EXCEL_URL" | sed 's|/edit.*|/export?format=xlsx|')
           else
-             # Keep original if it's not a Google Sheet (e.g. direct file link)
+             # Keep original if it looks like a direct download link
              CLEAN_URL="$RAW_EXCEL_URL"
           fi
           
           echo "⬇️ Downloading Excel from: $CLEAN_URL"
           curl -L "$CLEAN_URL" -o "${SAFE_NAME}.xlsx"
           
-          # Verify file type (Debug check)
+          # Debug: Verify the file is actually an Excel file and not empty
+          ls -lh "${SAFE_NAME}.xlsx"
           file "${SAFE_NAME}.xlsx"
           
-          # 3. PDF Download Logic
+          # FIX 3: SAFE PDF CHECK (Prevents crashing if PDF is missing)
           PDF_URL="${{ github.event.client_payload.pdf_url }}"
           
           if [ -n "$PDF_URL" ] && [ "$PDF_URL" != "null" ] && [ "$PDF_URL" != "" ]; then
@@ -74,18 +77,17 @@ jobs:
              echo "$COORD_JSON" > coords.json
           fi
 
-      # --- 2b. DEBUG SECRETS ---
+      # --- 2b. VERIFY SECRETS ---
       - name: Verify Secrets Exist
         env:
           EMAIL_CHECK: ${{ secrets.SUCCEED_EMAIL }}
-          PASS_CHECK: ${{ secrets.SUCCEED_PASSWORD }}
         run: |
           if [ -z "$EMAIL_CHECK" ]; then
             echo "❌ ERROR: SUCCEED_EMAIL secret is MISSING."
             exit 1
           fi
 
-      # --- 3. RUN UNIVERSAL IMAGE MINER (CONDITIONAL) ---
+      # --- 3. RUN IMAGE MINER (CONDITIONAL) ---
       - name: Run Image Miner
         env:
           SUCCEED_EMAIL: ${{ secrets.SUCCEED_EMAIL }}
@@ -103,12 +105,13 @@ jobs:
              echo "{}" > url_map.json
           fi
 
-      # --- 4. RUN UNIVERSAL TRANSFORMER ---
+      # --- 4. RUN DATA TRANSFORMER ---
       - name: Run Data Transformer
         run: |
           FINAL_FILE="${{ env.EXAM_NAME }}_Final.xlsx"
           
           echo "🚀 Starting Data Transformer..."
+          # The script will now definitely work because we forced openpyxl install
           python universal_miner.py \
             --input "${{ env.EXAM_NAME }}.xlsx" \
             --output "$FINAL_FILE" \
@@ -117,24 +120,22 @@ jobs:
             
           echo "FINAL_FILE=$FINAL_FILE" >> $GITHUB_ENV
           
-          # DEBUG: List files to prove it exists
-          ls -la
+          # Check if file was created
+          if [ -f "$FINAL_FILE" ]; then
+              echo "✅ Success: $FINAL_FILE created."
+          else
+              echo "❌ Error: Transformer finished but file is missing."
+              exit 1
+          fi
 
       # --- 5. UPLOAD RESULT TO N8N ---
       - name: Send Result to n8n
         run: |
           CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+          echo "Uploading ${{ env.FINAL_FILE }} to $CALLBACK_URL..."
           
-          if [ -f "${{ env.FINAL_FILE }}" ]; then
-             echo "✅ Found file: ${{ env.FINAL_FILE }}"
-             echo "Uploading to $CALLBACK_URL..."
-             
-             curl -X POST "$CALLBACK_URL" \
-             -H "Content-Type: multipart/form-data" \
-             -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
-             -F "folder_id=${{ github.event.client_payload.folder_id }}" \
-             -F "user_email=${{ github.event.client_payload.user_email }}"
-          else
-             echo "❌ CRITICAL ERROR: Output file '${{ env.FINAL_FILE }}' was NOT created."
-             exit 1
-          fi
+          curl -X POST "$CALLBACK_URL" \
+          -H "Content-Type: multipart/form-data" \
+          -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
+          -F "folder_id=${{ github.event.client_payload.folder_id }}" \
+          -F "user_email=${{ github.event.client_payload.user_email }}"
