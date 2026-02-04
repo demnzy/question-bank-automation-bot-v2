@@ -20,7 +20,6 @@ jobs:
         with:
           python-version: '3.9'
 
-      # CRITICAL FIX: Explicitly install openpyxl to prevent "engine" errors
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -29,21 +28,33 @@ jobs:
           pip install pandas openpyxl requests
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # --- 2. DOWNLOAD INPUTS (ROBUST) ---
+      # --- 2. DOWNLOAD INPUTS (WITH LINK REPAIR) ---
       - name: Download Files
         run: |
-          # Sanitize Exam Name
+          # 1. Sanitize Exam Name
           RAW_NAME="${{ github.event.client_payload.collection_name }}"
           SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[^a-zA-Z0-9._-]//g')
           if [ -z "$SAFE_NAME" ]; then SAFE_NAME="Exam_Export"; fi
-          
           echo "EXAM_NAME=$SAFE_NAME" >> $GITHUB_ENV
           
-          # 1. Download Excel
-          echo "Downloading Excel..."
-          curl -L "${{ github.event.client_payload.excel_url }}" -o "${SAFE_NAME}.xlsx"
+          # 2. LINK REPAIR: Convert Google Sheets 'Edit' link to 'Export' link
+          RAW_EXCEL_URL="${{ github.event.client_payload.excel_url }}"
           
-          # 2. Check PDF URL (Fixes Curl Crash)
+          # Regex logic: Replace '/edit...' with '/export?format=xlsx'
+          if [[ "$RAW_EXCEL_URL" == *"docs.google.com/spreadsheets"* ]]; then
+             CLEAN_URL=$(echo "$RAW_EXCEL_URL" | sed 's|/edit.*|/export?format=xlsx|')
+          else
+             # Keep original if it's not a Google Sheet (e.g. direct file link)
+             CLEAN_URL="$RAW_EXCEL_URL"
+          fi
+          
+          echo "⬇️ Downloading Excel from: $CLEAN_URL"
+          curl -L "$CLEAN_URL" -o "${SAFE_NAME}.xlsx"
+          
+          # Verify file type (Debug check)
+          file "${SAFE_NAME}.xlsx"
+          
+          # 3. PDF Download Logic
           PDF_URL="${{ github.event.client_payload.pdf_url }}"
           
           if [ -n "$PDF_URL" ] && [ "$PDF_URL" != "null" ] && [ "$PDF_URL" != "" ]; then
@@ -55,7 +66,7 @@ jobs:
              echo "HAS_PDF=false" >> $GITHUB_ENV
           fi
           
-          # 3. Save Coordinate Map
+          # 4. Save Coordinate Map
           COORD_JSON='${{ github.event.client_payload.image_lookup_json }}'
           if [ -z "$COORD_JSON" ]; then
              echo "{}" > coords.json
