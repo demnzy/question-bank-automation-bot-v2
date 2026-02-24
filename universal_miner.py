@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-universal_miner.py (V2.2 - Application Schema Aligned)
+universal_miner.py (V2.3 - Application Schema Aligned + Anti-Hallucination)
 
 Updates:
+- Sanitization: Added null eradicator, overlap deduplication, and hallucination filter.
 - Scenarios: Fuzzy fingerprinting to prevent duplicates; strict validation to reject false scenarios.
 - Options: Exact alignment with demo-all-types schema (IsCorrect boolean for Matrix, JSON Metadata for Dropdowns, CorrectOrder for Drag & Drop).
 - Questions: Added Hotspot_Variant extraction directly from LLM output.
@@ -14,8 +15,6 @@ import json
 import pandas as pd
 import uuid
 import hashlib
-from pathlib import Path
-from typing import Dict, List, Any
 
 # --- CONFIGURATION ---
 DEFAULT_CATEGORY_NAME = "IT & Technology"
@@ -117,6 +116,7 @@ def parse_options_v2(question_key, q_type, variant, options_str, correct_str):
     
     for idx, opt_raw in enumerate(raw_options, 1):
         opt_text = opt_raw.strip()
+        if not opt_text: continue
         
         # Strip Letter Prefix if exists
         match = re.match(r"^([A-Za-z])\)\s*(.*)", opt_text)
@@ -143,7 +143,6 @@ def parse_options_v2(question_key, q_type, variant, options_str, correct_str):
 
         elif q_type == 'hotspot' and variant == 'yes_no_matrix':
             # Yes/No Matrix: IsCorrect is True if the statement evaluates to Yes
-            # Example correct_str: "Option 1: Yes; Option 2: No"
             is_correct = False
             for correct_item in correct_sequence:
                 if text_body.lower() in correct_item.lower() and "yes" in correct_item.lower():
@@ -214,8 +213,22 @@ def main():
     try:
         df = pd.read_excel(args.input)
         df = normalize_columns(df)
+        
+        # --- 1. THE NULL ERADICATOR ---
+        df = df.replace(to_replace=r'(?i)^null$', value='', regex=True)
+        
+        # --- 2. OVERLAP DEDUPLICATION ---
+        df['QuestionHash'] = df['Question'].apply(lambda x: generate_robust_fingerprint(str(x)))
+        original_count = len(df)
+        df = df.drop_duplicates(subset=['QuestionHash'], keep='first')
+        print(f"Dropped {original_count - len(df)} duplicate questions caused by chunk overlap.")
+        
+        # --- 3. THE HALLUCINATION FILTER ---
+        df = df.dropna(subset=['Options'])
+        df = df[df['Options'].str.strip() != '']
+        
     except Exception as e:
-        print(f"Error reading file: {e}")
+        print(f"Error reading or sanitizing file: {e}")
         return
 
     # Load Image Lookup if provided
@@ -265,9 +278,7 @@ def main():
         scenario_key = None
         scen_text = clean_text(row.get('Scenario'))
         
-        # 1. Reject if "null", too short, or is an exact copy of the question stem
         if scen_text and scen_text.lower() != 'null' and len(scen_text) > 30 and scen_text.lower() not in q_text.lower():
-            # 2. Fuzzy Fingerprinting prevents duplicate scenarios due to minor spaces
             scen_fingerprint = generate_robust_fingerprint(scen_text)
             
             if scen_fingerprint in seen_scenarios:
@@ -289,7 +300,7 @@ def main():
             "QuestionKey": q_key, "QuizKey": quiz_key, "Type": q_type, 
             "Text": q_text, "Explanation": clean_text(row.get('Explanation')), "Points": DEFAULT_POINTS,
             "Order": quiz_counters[quiz_key], "ScenarioKey": scenario_key, "ScenarioOrder": 1 if scenario_key else None,
-            "Hint1": clean_text(row.get('Hints')), # Aligned with Demo schema
+            "Hints": clean_text(row.get('Hints')), 
             "PartialScoring": True if q_type in ['multiple_answer', 'drag_drop'] else False,
             "Variant": q_variant,
             "MediaUrl": media_val
@@ -308,7 +319,7 @@ def main():
         pd.DataFrame(tbl_questions).to_excel(writer, "Questions", index=False)
         pd.DataFrame(tbl_options).to_excel(writer, "Options", index=False)
 
-    print(f"V2.2 Schema Transformation Complete: {len(tbl_questions)} questions processed seamlessly.")
+    print(f"V2.3 Schema Transformation Complete: {len(tbl_questions)} questions processed cleanly.")
 
 if __name__ == "__main__":
     main()
