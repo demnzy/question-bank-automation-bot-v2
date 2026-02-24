@@ -101,7 +101,9 @@ def verify_and_rescue_text(image_bytes):
 # ----------------- MAIN -----------------
 
 def main():
-    if len(sys.argv) < 5: return # Expects excel, pdf, coords, output
+    if len(sys.argv) < 5: 
+        print("Missing arguments. Expects: excel, pdf, coords, output")
+        return 
 
     input_excel = sys.argv[1]
     pdf_path = sys.argv[2]
@@ -109,15 +111,23 @@ def main():
     output_json = sys.argv[4]
 
     token = login_and_get_token()
-    if not token: return
+    if not token: 
+        print("Exiting: Could not obtain auth token.")
+        return
 
+    # --- UPDATED: AGGRESSIVE ERROR HANDLING ---
     try:
         df = pd.read_excel(input_excel)
         doc = fitz.open(pdf_path)
         with open(coord_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
             coord_map = json.loads(raw) if isinstance(raw, str) else raw
-    except: return
+    except Exception as e:
+        print(f"CRITICAL ERROR LOADING FILES: {e}")
+        # Create an empty output file so the downstream step doesn't completely crash the workflow
+        with open(output_json, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+        return
 
     result_map = {} 
     ref_pattern = re.compile(r"<<(IMAGE_REF_\d+)>>")
@@ -151,7 +161,6 @@ def main():
                             result_map[q_text_clean] = url
 
                         # 3. CONSOLIDATION CHECK (The "Verification" Step)
-                        # Did Cirrascale treat a text box as an image by mistake?
                         is_drag_drop = "drag" in q_type or "drop" in q_type
                         is_empty_options = q_options == 'nan' or not q_options.strip()
 
@@ -161,7 +170,7 @@ def main():
                             
                             rescued_text = verify_and_rescue_text(img_bytes)
                             if rescued_text:
-                                # Save with _OCR suffix for Universal Miner to pick up
+                                # Save with _OCR suffix
                                 result_map[q_text_raw + "_OCR"] = rescued_text
                                 print(f"  -> Rescued Text: {rescued_text[:40]}...")
                             else:
