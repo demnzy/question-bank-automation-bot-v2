@@ -6,7 +6,6 @@ import fitz  # PyMuPDF
 import pandas as pd
 import cloudscraper
 import pytesseract
-import time
 from PIL import Image
 from io import BytesIO
 
@@ -19,7 +18,6 @@ scraper = cloudscraper.create_scraper()
 # ----------------- AUTH & UPLOAD -----------------
 
 def login_and_get_token():
-    # --- HARDCODED CREDENTIALS ---
     email = "odavies@readwriteds.com"
     password = "2862008June28?"
     
@@ -29,18 +27,14 @@ def login_and_get_token():
 
     try:
         response = scraper.post(LOGIN_URL, json={"email": email, "password": password})
-        
-        # Check for success
         if response.status_code in [200, 201]:
-            print("Login Successful!")
+            print("✅ Login Successful!")
             return response.json().get('data', {}).get('accessToken')
             
-        # If it fails, print the exact reason the server rejected it
-        print(f"Login Failed: {response.status_code} - {response.text}")
+        print(f"❌ Login Failed: {response.status_code} - {response.text}")
         return None
-        
     except Exception as e:
-        print(f"Login Exception occurred: {e}")
+        print(f"❌ Login Exception occurred: {e}")
         return None
 
 def upload_image_api(image_bytes, filename, token):
@@ -58,16 +52,17 @@ def upload_image_api(image_bytes, filename, token):
         return None
     except: return None
 
-# ----------------- COORDINATE CROPPER (SOURCE OF TRUTH) -----------------
+# ----------------- IMAGE CROPPING ENGINES -----------------
 
 def crop_image_from_coords(doc, page_num, bbox_str):
-    """
-    Precision Cropping using Cirrascale's BBOX (0-100 relative scale).
-    """
+    """PRIMARY: Precision Cropping using Cirrascale's BBOX."""
     try:
+        if not bbox_str or bbox_str.strip() == "" or bbox_str == "true":
+            return None 
+            
         parts = [float(x.strip()) for x in bbox_str.split(',')]
         if len(parts) != 4: return None
-        ymin, xmin, ymax, xmax = parts # Standard OLM output
+        ymin, xmin, ymax, xmax = parts 
 
         page_idx = int(page_num) - 1 
         if page_idx < 0 or page_idx >= len(doc): return None
@@ -79,21 +74,49 @@ def crop_image_from_coords(doc, page_num, bbox_str):
             (max(0, xmin)/100)*w, (max(0, ymin)/100)*h,
             (min(100, xmax)/100)*w, (min(100, ymax)/100)*h
         )
-        # High DPI for clear Hotspots/Diagrams
         return page.get_pixmap(clip=clip_rect, dpi=200).tobytes("jpg")
-    except: return None
+    except Exception as e: 
+        print(f"    -> [CROP EXCEPTION]: {e}")
+        return None
 
-# ----------------- CONSOLIDATION / VERIFICATION -----------------
+def crop_image_via_text_anchoring(doc, q_text):
+    """FALLBACK: Searches PDF for the question text and crops the area below it."""
+    if not q_text or len(q_text) < 15: return None
+    
+    # Clean text and try a long search string, then a shorter one if it fails
+    clean = re.sub(r"<<.*?>>", "", q_text).strip()
+    search_targets = [clean[:60], clean[:30]]
+
+    for target in search_targets:
+        target = target.strip()
+        if len(target) < 10: continue
+            
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            rects = page.search_for(target)
+            
+            if rects:
+                # Find the bottom-most Y coordinate of the found text
+                bottom_y = max([r.y1 for r in rects])
+                w, h = page.rect.width, page.rect.height
+                
+                # Crop from just below the text down to either 400pts or the page bottom
+                y0 = min(bottom_y + 10, h) 
+                y1 = min(y0 + 400, h)
+                
+                clip_rect = fitz.Rect(0, y0, w, y1)
+                try:
+                    return page.get_pixmap(clip=clip_rect, dpi=200).tobytes("jpg")
+                except:
+                    return None
+    return None
+
+# ----------------- OCR RESCUE -----------------
 
 def verify_and_rescue_text(image_bytes):
-    """
-    FALLBACK ONLY: If Cirrascale missed the text and gave an image instead,
-    we use Tesseract to consolidate the data.
-    """
     try:
         img = Image.open(BytesIO(image_bytes))
         text = pytesseract.image_to_string(img)
-        # Format as semicolon list for the Options column
         clean = [l.strip() for l in text.split('\n') if l.strip()]
         return "; ".join(clean)
     except: return None
@@ -102,7 +125,7 @@ def verify_and_rescue_text(image_bytes):
 
 def main():
     if len(sys.argv) < 5: 
-        print("Missing arguments. Expects: excel, pdf, coords, output")
+        print("❌ Missing arguments. Expects: excel, pdf, coords, output")
         return 
 
     input_excel = sys.argv[1]
@@ -112,75 +135,108 @@ def main():
 
     token = login_and_get_token()
     if not token: 
-        print("Exiting: Could not obtain auth token.")
+        print("❌ Exiting: Could not obtain auth token.")
         return
 
-    # --- UPDATED: AGGRESSIVE ERROR HANDLING ---
+    # --- AGGRESSIVE ERROR HANDLING (Prevents Empty JSON Crash) ---
     try:
         df = pd.read_excel(input_excel)
         doc = fitz.open(pdf_path)
+        
         with open(coord_path, 'r', encoding='utf-8') as f:
-            raw = json.load(f)
-            coord_map = json.loads(raw) if isinstance(raw, str) else raw
+            file_content = f.read().strip()
+            if not file_content:
+                coord_map = {}
+                print("⚠️ coords.json was empty. Defaulting to an empty map.")
+            else:
+                raw = json.loads(file_content)
+                coord_map = json.loads(raw) if isinstance(raw, str) else raw
+                print(f"✅ Loaded {len(coord_map)} entries from coords.json")
+                
     except Exception as e:
-        print(f"CRITICAL ERROR LOADING FILES: {e}")
-        # Create an empty output file so the downstream step doesn't completely crash the workflow
-        with open(output_json, 'w', encoding='utf-8') as f:
-            json.dump({}, f)
+        print(f"\n🚨 CRITICAL ERROR LOADING FILES 🚨\n{e}\n")
+        with open(output_json, 'w', encoding='utf-8') as f: json.dump({}, f)
         return
 
     result_map = {} 
     ref_pattern = re.compile(r"<<(IMAGE_REF_\d+)>>")
 
-    print(f"Consolidating V2 Data for {len(df)} questions...")
+    # Tracking Stats
+    stats = {"primary_success": 0, "anchor_rescues": 0, "failures": 0}
+
+    print(f"\n--- Starting V2 Hybrid Image Extraction for {len(df)} questions ---\n")
 
     for idx, row in df.iterrows():
         q_text_raw = str(row.get('Question', ''))
-        # Clean text for mapping (stripping tokens)
         q_text_clean = re.sub(r"<<IMAGE_REF_\d+>>", "", q_text_raw).strip()
-        
         q_type = str(row.get('Question_Type', '')).lower()
         q_options = str(row.get('Options', ''))
-
-        # Check for Image References (Source of Truth)
-        matches = ref_pattern.findall(q_text_raw)
         
+        has_image_raw = str(row.get('has_image', '')).lower()
+        is_has_image_true = has_image_raw in ['true', '1', 'yes']
+
+        matches = ref_pattern.findall(q_text_raw)
+        img_bytes = None
+        used_anchor = False
+        ref_name = "AUTO"
+
         if matches:
             for ref_id in matches:
-                if ref_id in coord_map:
-                    # 1. Retrieve Data from Source of Truth
+                ref_name = ref_id
+                # Strategy 1: CirraScale Coordinates
+                if ref_id in coord_map and coord_map[ref_id].get('coordinates') not in ['', 'true']:
                     meta = coord_map[ref_id]
-                    img_bytes = crop_image_from_coords(doc, meta.get('page', 1), meta.get('coordinates', ''))
+                    img_bytes = crop_image_from_coords(doc, meta.get('page', 1), meta.get('coordinates'))
+                
+                # Strategy 2: Fallback to Text Anchoring if coords missing/empty
+                if not img_bytes:
+                    print(f"⚠️ Q{idx+1} [{ref_id}]: Coords missing/invalid. Attempting Text Anchor Rescue...")
+                    img_bytes = crop_image_via_text_anchoring(doc, q_text_clean)
+                    used_anchor = True
+        else:
+            # Strategy 3: No tags, but 'has_image' is true
+            if is_has_image_true:
+                print(f"🔍 Q{idx+1}: 'has_image=True' but no tags. Attempting Text Anchor Rescue...")
+                img_bytes = crop_image_via_text_anchoring(doc, q_text_clean)
+                used_anchor = True
+
+        # Upload Logic
+        if img_bytes:
+            url = upload_image_api(img_bytes, f"q{idx+1}_{ref_name}.jpg", token)
+            if url:
+                if used_anchor:
+                    print(f"⚓ Q{idx+1}: RESCUED via Text Anchor -> {url}")
+                    stats["anchor_rescues"] += 1
+                else:
+                    print(f"✅ Q{idx+1}: CirraScale Crop -> {url}")
+                    stats["primary_success"] += 1
                     
-                    if img_bytes:
-                        # 2. Universal Upload (Hotspots, Exhibits, etc.)
-                        url = upload_image_api(img_bytes, f"q{idx+1}_{ref_id}.jpg", token)
-                        if url:
-                            print(f"Q{idx+1}: Image Mapped -> {url}")
-                            result_map[q_text_raw] = url
-                            result_map[q_text_clean] = url
+                result_map[q_text_raw] = url
+                result_map[q_text_clean] = url
 
-                        # 3. CONSOLIDATION CHECK (The "Verification" Step)
-                        is_drag_drop = "drag" in q_type or "drop" in q_type
-                        is_empty_options = q_options == 'nan' or not q_options.strip()
-
-                        if is_drag_drop and is_empty_options:
-                            print(f"  [WARN] Q{idx+1}: Drag/Drop options missing! Cirrascale gave image instead of text.")
-                            print(f"  -> Attempting Tesseract Rescue...")
-                            
-                            rescued_text = verify_and_rescue_text(img_bytes)
-                            if rescued_text:
-                                # Save with _OCR suffix
-                                result_map[q_text_raw + "_OCR"] = rescued_text
-                                print(f"  -> Rescued Text: {rescued_text[:40]}...")
-                            else:
-                                print(f"  -> Rescue Failed. Question may need manual review.")
+                # Check if we need to OCR a drag/drop image
+                if ("drag" in q_type or "drop" in q_type) and (q_options == 'nan' or not q_options.strip()):
+                    rescued_text = verify_and_rescue_text(img_bytes)
+                    if rescued_text: result_map[q_text_raw + "_OCR"] = rescued_text
+            else:
+                print(f"❌ Q{idx+1}: Cropped successfully, but UPLOAD FAILED.")
+                stats["failures"] += 1
+        elif matches or is_has_image_true:
+            print(f"❌ Q{idx+1}: All extraction methods failed.")
+            stats["failures"] += 1
 
     # Save Final Map
     with open(output_json, 'w', encoding='utf-8') as f:
         json.dump(result_map, f, indent=4)
 
-    print(f"Consolidation Complete. Output: {output_json}")
+    # --- PRINT SUMMARY ---
+    print("\n" + "="*40)
+    print("📊 V2 HYBRID MINER SUMMARY")
+    print("="*40)
+    print(f"✅ Primary (CirraScale) Success: {stats['primary_success']}")
+    print(f"⚓ Fallback (Anchor) Rescues  : {stats['anchor_rescues']}")
+    print(f"❌ Total Failures            : {stats['failures']}")
+    print("="*40 + "\n")
 
 if __name__ == "__main__":
     main()
