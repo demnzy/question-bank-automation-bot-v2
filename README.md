@@ -1,340 +1,173 @@
-# QB Automation Bot — v2
+# Question Bank Automation Bot (v2)
 
-> Extended question bank automation pipeline supporting **seven question types** — from standard MCQ and True/False through to Fill in the Gaps, Hotspot Simulations, Matching, Ordering, and Short Answer — all transformed from raw exam PDFs to precise LMS-ready schemas.
+Extends [v1](https://github.com/demnzy/question-bank-automation-bot) to the question types that depend on images or structure: **hotspot** (three variants), **drag-and-drop ordering** and **case-study scenarios**, alongside standard multiple choice and multiple answer. It turns the LLM-extracted table for an exam dump into an LMS-ready workbook, and for questions that reference a figure it crops the figure out of the source PDF, uploads it, and stores the URL in the question's `MediaUrl` column.
 
-**Stack:** Python · PyMuPDF (fitz) · GitHub Actions · n8n
+**Stack:** Python 3.9, pandas, openpyxl, PyMuPDF, Tesseract (pytesseract), GitHub Actions, n8n
 
-> v2 is a superset of [QB Bot v1](https://github.com/demnzy/qb-bot-v1). Everything v1 does, v2 does — plus significantly more.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [How It Works](#how-it-works)
-- [Question Types Supported](#question-types-supported)
-- [Repository Structure](#repository-structure)
-- [Setup](#setup)
-  - [Secrets & Environment Variables](#secrets--environment-variables)
-  - [Triggering the Workflow](#triggering-the-workflow)
-- [Output Schema](#output-schema)
-  - [Fill in the Gaps](#fill-in-the-gaps)
-  - [Hotspot Simulation](#hotspot-simulation)
-  - [Matching](#matching)
-  - [Ordering](#ordering)
-  - [Short Answer](#short-answer)
-- [Local Development](#local-development)
-- [Differences from v1](#differences-from-v1)
-
----
-
-## Overview
-
-QB Bot v2 extends the v1 pipeline to handle the full complexity of modern LMS question formats. Where v1 handles flat, text-only question types, v2 introduces a modular classifier architecture that detects structural patterns in PDFs corresponding to interactive and compound question types — including cloze-style fill-in-the-gaps, image-referenced hotspot questions, and multi-column matching exercises.
-
-The automation chain is identical to v1: n8n triggers a GitHub Actions workflow, Python runs the extraction and classification inside the Action, and structured JSON output is pushed to the configured storage target for downstream LMS ingestion.
-
----
-
-## How It Works
+## Pipeline
 
 ```
-n8n Workflow
-    │
-    │  Webhook trigger (POST with PDF reference or payload)
-    ▼
-GitHub Actions (repository_dispatch)
-    │
-    ├── Checkout repo
-    ├── Set up Python environment
-    ├── Install dependencies
-    └── Run transform.py
-            │
-            ├── Load PDF with PyMuPDF (fitz)
-            ├── Extract raw text and layout metadata page by page
-            ├── Run ClassifierPipeline
-            │       │
-            │       ├── MCQClassifier
-            │       ├── TrueFalseClassifier
-            │       ├── FillInGapsClassifier       ← new in v2
-            │       ├── HotspotClassifier          ← new in v2
-            │       ├── MatchingClassifier         ← new in v2
-            │       ├── OrderingClassifier         ← new in v2
-            │       └── ShortAnswerClassifier      ← new in v2
-            │
-            ├── Merge and deduplicate detected questions
-            ├── Validate against output schema v2
-            └── Write structured JSON per question type
-                    │
-                    ▼
-            Push to repo / storage bucket
-                    │
-                    ▼
-            n8n routes output to LMS API
+n8n workflow A
+  LLM extraction of the PDF -> Excel table + per-figure bounding boxes
+  sends a repository_dispatch event
+        |
+        v
+GitHub Actions (.github/workflows/transform_v2.yml)
+  1. download the Excel (Google Sheets links are rewritten to .xlsx export links)
+  2. download the PDF if a pdf_url was given
+  3. write image_lookup_json from the payload to coords.json
+  4. universal_image_miner.py  -> url_map.json   {question text: image URL}
+  5. universal_miner.py        -> <exam>_Final.xlsx
+  6. POST the workbook to the n8n callback URL
+        |
+        v
+n8n workflow B
+  receives the file together with folder_id and user_email
 ```
 
-The classifier pipeline runs each detector in sequence. Questions that match multiple classifiers (edge cases in badly formatted PDFs) are resolved by a confidence-scoring tiebreaker that selects the most structurally complete interpretation.
+If no `pdf_url` is supplied, the miner step is skipped and an empty `url_map.json` is used, so text-only exams still go through.
 
----
+## Supported question types
 
-## Question Types Supported
+| `Question_Type` | Handling |
+|---|---|
+| `multiple_choice`, `multiple_answer` | `A) text; B) text` options, letters in `Correct_Options` set `IsCorrect`. `PartialScoring` is on for multiple answer |
+| `hotspot` | Variant stored in `Variant`: `click_region`, `yes_no_matrix` or `dropdown` (see below) |
+| `drag_drop` | Each option gets a `CorrectOrder` from its position in the answer sequence. `PartialScoring` is on |
 
-| Type | v1 | v2 | Detection Approach |
-|---|:---:|:---:|---|
-| Multiple Choice (MCQ) | ✅ | ✅ | Option labels A–D in proximity to stem |
-| True / False | ✅ | ✅ | Boolean keywords after statement |
-| Fill in the Gaps | — | ✅ | Blank markers (`___`, `[...]`, numbered gaps) in sentence body |
-| Hotspot Simulation | — | ✅ | Image reference with labelled target zones or coordinate markers |
-| Matching | — | ✅ | Two-column layout with paired items and connectors |
-| Ordering / Sequencing | — | ✅ | Numbered or lettered items presented out of sequence with ordering instruction |
-| Short Answer | — | ✅ | Open-ended stem with no options and a defined answer field |
+Hotspot variants come from a `Hotspot_Variant` column when the LLM supplies one. Otherwise they are inferred: `[SLOT` in the question or options means `dropdown`, "select yes" or "true or false" means `yes_no_matrix`, anything else is `click_region`.
 
----
+| Variant | Option rows |
+|---|---|
+| `yes_no_matrix` | One row per statement, `IsCorrect` is true when the answer for that statement is Yes |
+| `dropdown` | One row per slot. `Text` holds the slot id and `Metadata` holds `{"slotId", "choices", "correctChoice"}` as JSON |
+| `click_region` | `Metadata` holds a rectangle (`variant`, `shape`, `coords`). **These coordinates are placeholders, not detected regions** (see limitations) |
 
-## Repository Structure
+**Scenarios.** Where a row has a `Scenario` (case-study or exhibit text longer than 30 characters that is not already in the question), it goes to a `Scenarios` sheet, deduplicated by a normalised-text fingerprint so questions sharing a case study share one scenario row.
 
+## Input
+
+Excel table (first sheet). Column names are matched case-insensitively, with spaces and dots normalised.
+
+| Column | Notes |
+|---|---|
+| `Question` | May include `<<IMAGE_REF_n>>` tags marking figures |
+| `Options` | `A) text; B) text`. Rows with empty options are dropped |
+| `Correct_Options` | Also accepted as `Correct Options` or `Answers` |
+| `Question_Type`, `Hotspot_Variant` | See above |
+| `Scenario`, `Explanation`, `Hints` | Optional |
+| `Category`, `Collection`, `Quiz`, `difficulty` | `Collection` falls back to `--collection`, then a default |
+| `has_image` | `true`/`1`/`yes` for figure questions without tags |
+
+`Correct_Options` formats: letters (`A) text`) for choice questions, and for drag-and-drop or matrices an ordered `;`-separated list (`step one; step two`, or `Statement - Yes; Statement - No`).
+
+## Output
+
+`<exam>_Final.xlsx` with sheets `Categories`, `Collections`, `Quizzes`, `Scenarios`, `Questions`, `Options`.
+
+- **Questions:** `QuestionKey`, `QuizKey`, `Type`, `Text`, `Explanation`, `Points`, `Order`, `ScenarioKey`, `ScenarioOrder`, `Hints`, `PartialScoring`, `Variant`, `MediaUrl`
+- **Options:** `QuestionKey`, `Text`, `IsCorrect`, `OrderIndex`, `Metadata`, `CorrectOrder`
+- Keys are deterministic (name prefix plus content hash), so re-running on the same input gives the same keys. Fixed values: `Points = 1`, `PassMark = 70`.
+- `MediaUrl` is the uploaded image URL. If a question is flagged `has_image` but no URL was found, it is set to `1` as a marker for manual follow-up.
+
+## Sanitisation (same as v1)
+
+Before any parsing, `universal_miner.py` removes literal `null` strings, drops duplicate questions caused by overlapping extraction chunks (normalised-text MD5, first occurrence kept), and drops rows with no options.
+
+## Image extraction
+
+`universal_image_miner.py` tries three strategies per question and uploads the first crop it gets (200 dpi JPEG):
+
+1. **Bounding box.** For each `<<IMAGE_REF_n>>` tag, look up `n` in `coords.json`. Each entry has a `page` (1-indexed) and `coordinates` as `"ymin,xmin,ymax,xmax"` in percent of the page size. This is the precise path; the boxes come from the extraction model in workflow A.
+2. **Text anchor (fallback).** If the box is missing or invalid, search the PDF for the first 60 characters of the question (then 30) and crop 400 pt of full page width below the match.
+3. **No tags.** If there is no tag but `has_image` is true, go straight to the text anchor.
+
+The result goes into `url_map.json`, keyed by the question text, which the transformer maps into `MediaUrl`. The run prints how many images came from bounding boxes, how many were rescued by text anchoring, and how many failed.
+
+For drag-and-drop questions that have an image but no options, the miner also runs Tesseract on the crop and writes the text to `url_map.json` under `"<question text>_OCR"`. The transformer does not currently read this entry.
+
+## Running it
+
+### Through GitHub Actions
+
+Trigger with a `repository_dispatch` event of type `start-processing`:
+
+```bash
+curl -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://api.github.com/repos/demnzy/question-bank-automation-bot-v2/dispatches \
+  -d '{
+    "event_type": "start-processing",
+    "client_payload": {
+      "collection_name": "AZ-305",
+      "excel_url": "https://example.com/extracted.xlsx",
+      "pdf_url": "https://example.com/exam.pdf",
+      "image_lookup_json": "{\"IMAGE_REF_1\": {\"page\": 3, \"coordinates\": \"20.5,10,55,90\"}}",
+      "callback_url": "https://your-n8n-host/webhook/final",
+      "folder_id": "FOLDER_ID",
+      "user_email": "user@example.com"
+    }
+  }'
 ```
-qb-bot-v2/
-│
-├── .github/
-│   └── workflows/
-│       └── transform.yml            # GitHub Actions workflow definition
-│
-├── scripts/
-│   ├── transform.py                 # Entry point — orchestrates the full pipeline
-│   ├── classifier_pipeline.py       # Runs all classifiers in sequence
-│   │
-│   └── classifiers/
-│       ├── base.py                  # BaseClassifier abstract class
-│       ├── mcq.py
-│       ├── true_false.py
-│       ├── fill_in_gaps.py
-│       ├── hotspot.py
-│       ├── matching.py
-│       ├── ordering.py
-│       └── short_answer.py
-│
-├── schemas/
-│   ├── question_schema_v1.json      # v1 schema (MCQ + T/F) — kept for reference
-│   └── question_schema_v2.json      # v2 schema — all types
-│
-├── input/
-│   └── .gitkeep
-│
-├── output/
-│   └── .gitkeep
-│
-├── tests/
-│   ├── test_mcq.py
-│   ├── test_fill_in_gaps.py
-│   ├── test_hotspot.py
-│   └── test_matching.py
-│
-├── requirements.txt
-├── .env.example
-└── README.md
-```
 
----
+| Payload key | Used for |
+|---|---|
+| `collection_name` | Sanitised into file names and passed as `--collection` |
+| `excel_url` | Input table (Google Sheets `/edit` links are converted to `/export?format=xlsx`) |
+| `pdf_url` | Optional. Without it, image extraction is skipped |
+| `image_lookup_json` | Optional. Bounding-box map written to `coords.json` |
+| `callback_url` | Where the workbook is POSTed |
+| `folder_id`, `user_email` | Passed through to n8n workflow B unchanged |
 
-## Setup
-
-### Secrets & Environment Variables
-
-Add the following secrets under **Settings → Secrets and variables → Actions**:
+**Repository secrets:**
 
 | Secret | Description |
 |---|---|
-| `N8N_WEBHOOK_URL` | The n8n webhook URL to notify on completion |
-| `STORAGE_BUCKET_URL` | Target storage URL for output JSON |
-| `STORAGE_ACCESS_KEY` | Access credentials for the storage target |
+| `SUCCEED_EMAIL` | LMS account used to upload images (the workflow fails early if it is missing) |
+| `SUCCEED_PASSWORD` | Password for that account |
 
-For local development, copy `.env.example` to `.env`:
+The scripts read these from environment variables. Never commit credentials to the repository.
 
-```env
-N8N_WEBHOOK_URL=https://your-n8n-instance/webhook/qb-bot-v2
-STORAGE_BUCKET_URL=https://your-bucket-url
-STORAGE_ACCESS_KEY=your-access-key
-```
-
-### Triggering the Workflow
-
-**From n8n** — use the `HTTP Request` node to fire a `repository_dispatch` event:
-
-```
-POST https://api.github.com/repos/{owner}/qb-bot-v2/dispatches
-
-Headers:
-  Authorization: Bearer <GITHUB_PAT>
-  Accept: application/vnd.github.v3+json
-
-Body:
-{
-  "event_type": "transform-pdf",
-  "client_payload": {
-    "pdf_url": "https://link-to-your-pdf.pdf",
-    "exam_id": "exam_042",
-    "question_types": ["mcq", "fill_in_gaps", "hotspot"]
-  }
-}
-```
-
-The optional `question_types` array scopes the classifier pipeline to only run the detectors you need, which speeds up processing on large PDFs where you know the content ahead of time. Omit it to run all classifiers.
-
-**Manually (GitHub UI):**
-
-Go to **Actions → Transform PDF v2 → Run workflow**.
-
-**From the CLI:**
+### Locally
 
 ```bash
-gh workflow run transform.yml \
-  -f pdf_url="https://link-to-your-pdf.pdf" \
-  -f exam_id="exam_042"
+pip install -r requirements.txt            # also needs the tesseract binary
+export SUCCEED_EMAIL="..." SUCCEED_PASSWORD="..."
+
+python universal_image_miner.py exam.xlsx exam.pdf coords.json url_map.json
+python universal_miner.py \
+  --input exam.xlsx \
+  --output exam_Final.xlsx \
+  --lookup url_map.json \
+  --collection "AZ-305"
 ```
-
----
-
-## Output Schema
-
-All output is written as a JSON array. Each item contains a `type` field that identifies its structure. Examples for the question types introduced in v2:
-
-### Fill in the Gaps
-
-```json
-{
-  "type": "fill_in_gaps",
-  "exam_id": "exam_042",
-  "question_number": 5,
-  "text": "The process by which plants convert sunlight into energy is called ___1___, and it takes place in the ___2___.",
-  "gaps": {
-    "1": "photosynthesis",
-    "2": "chloroplast"
-  },
-  "explanation": ""
-}
-```
-
-### Hotspot Simulation
-
-```json
-{
-  "type": "hotspot",
-  "exam_id": "exam_042",
-  "question_number": 8,
-  "instruction": "Click on the part of the cell responsible for energy production.",
-  "image_reference": "figure_3_cell_diagram",
-  "correct_zone": "mitochondria",
-  "zones": ["nucleus", "mitochondria", "cell_membrane", "vacuole"],
-  "explanation": ""
-}
-```
-
-### Matching
-
-```json
-{
-  "type": "matching",
-  "exam_id": "exam_042",
-  "question_number": 11,
-  "instruction": "Match each term to its correct definition.",
-  "pairs": [
-    { "left": "Osmosis", "right": "Movement of water across a semi-permeable membrane" },
-    { "left": "Diffusion", "right": "Net movement of particles from high to low concentration" },
-    { "left": "Active transport", "right": "Movement of substances against a concentration gradient" }
-  ],
-  "explanation": ""
-}
-```
-
-### Ordering
-
-```json
-{
-  "type": "ordering",
-  "exam_id": "exam_042",
-  "question_number": 14,
-  "instruction": "Arrange the following steps of mitosis in the correct order.",
-  "items": ["Anaphase", "Telophase", "Metaphase", "Prophase"],
-  "correct_order": ["Prophase", "Metaphase", "Anaphase", "Telophase"],
-  "explanation": ""
-}
-```
-
-### Short Answer
-
-```json
-{
-  "type": "short_answer",
-  "exam_id": "exam_042",
-  "question_number": 17,
-  "stem": "Explain the role of insulin in blood glucose regulation.",
-  "sample_answer": "Insulin is released by the pancreas in response to high blood glucose levels. It stimulates cells to absorb glucose, lowering blood sugar back to a normal range.",
-  "marks": 3,
-  "explanation": ""
-}
-```
-
----
-
-## Local Development
-
-```bash
-# 1. Clone the repo
-git clone https://github.com/demnzy/qb-bot-v2.git
-cd qb-bot-v2
-
-# 2. Set up a virtual environment
-python -m venv venv
-source venv/bin/activate      # Windows: venv\Scripts\activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Drop a PDF into input/
-cp your-exam.pdf input/
-
-# 5. Run the full pipeline locally
-python scripts/transform.py \
-  --input input/your-exam.pdf \
-  --exam_id exam_042
-
-# Run with specific classifiers only
-python scripts/transform.py \
-  --input input/your-exam.pdf \
-  --exam_id exam_042 \
-  --types mcq fill_in_gaps hotspot
-
-# Output: output/exam_042_transformed.json
-```
-
-**Running tests:**
-
-```bash
-pytest tests/ -v
-```
-
----
 
 ## Differences from v1
 
-| Feature | v1 | v2 |
+| | v1 | v2 |
 |---|---|---|
-| MCQ support | ✅ | ✅ |
-| True/False support | ✅ | ✅ |
-| Fill in the Gaps | — | ✅ |
-| Hotspot Simulation | — | ✅ |
-| Matching | — | ✅ |
-| Ordering / Sequencing | — | ✅ |
-| Short Answer | — | ✅ |
-| Modular classifier architecture | — | ✅ |
-| Scoped classifier runs via `question_types` | — | ✅ |
-| Confidence-scoring tiebreaker | — | ✅ |
-| Test suite | — | ✅ |
-| Schema version | v1 | v2 |
+| Question types | multiple choice, multiple answer, true/false | adds hotspot (3 variants), drag-and-drop, scenarios |
+| Output template | Column names read from `SQ_template.xlsx` | Columns fixed in code, plus a `Scenarios` sheet |
+| Image cropping | Text anchor only | Bounding box first, text anchor fallback |
+| Input | Excel, CSV or JSON | Excel |
+| Optional PDF | No | Yes |
 
-If your PDFs only contain MCQ and True/False questions, [v1](https://github.com/demnzy/qb-bot-v1) is simpler and faster. Use v2 when your exam content includes any of the extended types.
+## Known limitations
 
----
+- Click-region hotspot rectangles are generated placeholders. The real clickable regions still need to be set in the LMS.
+- OCR text for drag-and-drop images is written to `url_map.json` but is not yet used by the transformer.
+- Images are matched to questions by exact question text, so edits to the text between extraction and transformation break the match (the question then gets the `1` placeholder).
+- The tag keyword map is Azure-specific, and the defaults are generic (`IT & Technology`, `General Certification`).
+- Answer parsing for matrices and dropdowns relies on substring matching against the answer text, so unusual answer wording can be mis-assigned. Spot-check these types.
 
-Built by [Oluwatobiloba (Daniel) Davies](https://github.com/demnzy) · [LinkedIn](https://linkedin.com/in/oluwatobiloba-davies)
+## Repository layout
+
+```
+.github/workflows/transform_v2.yml   Actions workflow (repository_dispatch)
+universal_image_miner.py             crop, OCR-rescue and upload question images
+universal_miner.py                   transform the table into the LMS workbook
+requirements.txt
+```
+
+Built by [Oluwatobiloba (Daniel) Davies](https://github.com/demnzy).
