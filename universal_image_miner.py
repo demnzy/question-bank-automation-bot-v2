@@ -18,8 +18,8 @@ scraper = cloudscraper.create_scraper()
 # ----------------- AUTH & UPLOAD -----------------
 
 def login_and_get_token():
-    email = "odavies@readwriteds.com"
-    password = "2862008June28?"
+    email = os.environ.get("SUCCEED_EMAIL")
+    password = os.environ.get("SUCCEED_PASSWORD")
     
     if not email or not password: 
         print("Missing hardcoded email or password.")
