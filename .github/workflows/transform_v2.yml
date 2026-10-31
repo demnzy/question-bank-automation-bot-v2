@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      
+
     steps:
       # --- 1. SETUP ENVIRONMENT ---
       - name: Checkout Code
@@ -20,14 +20,12 @@ jobs:
         with:
           python-version: '3.9'
 
-      # FIX 1: FORCE INSTALL OPENPYXL (Solves "engine not determined" error)
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr
           pip install --upgrade pip
           pip install pandas openpyxl requests
-          # Install other requirements if they exist, but we prioritized the critical ones above
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       # --- 2. DOWNLOAD INPUTS (WITH LINK REPAIR) ---
@@ -38,37 +36,32 @@ jobs:
           SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[^a-zA-Z0-9._-]//g')
           if [ -z "$SAFE_NAME" ]; then SAFE_NAME="Exam_Export"; fi
           echo "EXAM_NAME=$SAFE_NAME" >> $GITHUB_ENV
-          
-          # FIX 2: LINK REPAIR (Forces Google Drive to give a real .xlsx file, not HTML)
+
+          # 2. Convert Google Drive /edit URL to direct /export?format=xlsx
           RAW_EXCEL_URL="${{ github.event.client_payload.excel_url }}"
-          
           if [[ "$RAW_EXCEL_URL" == *"docs.google.com/spreadsheets"* ]]; then
-             # Convert /edit link to /export link
              CLEAN_URL=$(echo "$RAW_EXCEL_URL" | sed 's|/edit.*|/export?format=xlsx|')
           else
-             # Keep original if it looks like a direct download link
              CLEAN_URL="$RAW_EXCEL_URL"
           fi
-          
-          echo "⬇️ Downloading Excel from: $CLEAN_URL"
+
+          echo "[INFO] Downloading Excel from: $CLEAN_URL"
           curl -L "$CLEAN_URL" -o "${SAFE_NAME}.xlsx"
-          
-          # Debug: Verify the file is actually an Excel file and not empty
+
           ls -lh "${SAFE_NAME}.xlsx"
           file "${SAFE_NAME}.xlsx"
-          
-          # FIX 3: SAFE PDF CHECK (Prevents crashing if PDF is missing)
+
+          # 3. Download source PDF if provided
           PDF_URL="${{ github.event.client_payload.pdf_url }}"
-          
           if [ -n "$PDF_URL" ] && [ "$PDF_URL" != "null" ] && [ "$PDF_URL" != "" ]; then
-             echo "Downloading PDF from $PDF_URL..."
+             echo "[INFO] Downloading PDF from: $PDF_URL"
              curl -L "$PDF_URL" -o "${SAFE_NAME}.pdf"
              echo "HAS_PDF=true" >> $GITHUB_ENV
           else
-             echo "⚠️ No PDF URL provided. Skipping PDF download."
+             echo "[INFO] No PDF URL provided; skipping PDF download."
              echo "HAS_PDF=false" >> $GITHUB_ENV
           fi
-          
+
           # 4. Save Coordinate Map
           COORD_JSON='${{ github.event.client_payload.image_lookup_json }}'
           if [ -z "$COORD_JSON" ]; then
@@ -83,7 +76,7 @@ jobs:
           EMAIL_CHECK: ${{ secrets.SUCCEED_EMAIL }}
         run: |
           if [ -z "$EMAIL_CHECK" ]; then
-            echo "❌ ERROR: SUCCEED_EMAIL secret is MISSING."
+            echo "[ERROR] SUCCEED_EMAIL secret is missing."
             exit 1
           fi
 
@@ -94,14 +87,14 @@ jobs:
           SUCCEED_PASSWORD: ${{ secrets.SUCCEED_PASSWORD }}
         run: |
           if [ "${{ env.HAS_PDF }}" == "true" ]; then
-             echo "✅ PDF Found. Running Image Miner..."
+             echo "[INFO] PDF found. Running hybrid image miner..."
              python universal_image_miner.py \
                "${{ env.EXAM_NAME }}.xlsx" \
                "${{ env.EXAM_NAME }}.pdf" \
                coords.json \
                url_map.json
           else
-             echo "⚠️ No PDF. Skipping Image Miner and creating empty url_map."
+             echo "[INFO] No PDF. Initializing empty url_map.json..."
              echo "{}" > url_map.json
           fi
 
@@ -109,50 +102,44 @@ jobs:
       - name: Run Data Transformer
         run: |
           FINAL_FILE="${{ env.EXAM_NAME }}_Final.xlsx"
-          
-          echo "🚀 Starting Data Transformer..."
-          # The script will now definitely work because we forced openpyxl install
+
+          echo "[INFO] Starting data transformer..."
           python universal_miner.py \
             --input "${{ env.EXAM_NAME }}.xlsx" \
             --output "$FINAL_FILE" \
             --lookup url_map.json \
             --collection "${{ env.EXAM_NAME }}"
-            
+
           echo "FINAL_FILE=$FINAL_FILE" >> $GITHUB_ENV
-          
-          # Check if file was created
+
           if [ -f "$FINAL_FILE" ]; then
-              echo "✅ Success: $FINAL_FILE created."
+              echo "[INFO] Success: $FINAL_FILE created."
           else
-              echo "❌ Error: Transformer finished but file is missing."
+              echo "[ERROR] Transformer finished but $FINAL_FILE is missing."
               exit 1
           fi
 
-# --- 5. UPLOAD RESULT TO N8N (FIXED) ---
+      # --- 5. UPLOAD RESULT TO N8N ---
       - name: Send Result to n8n
         run: |
           RAW_URL="${{ github.event.client_payload.callback_url }}"
-          
-          # FIX 1: Force HTTPS if missing
+
           if [[ "$RAW_URL" != http* ]]; then
              CALLBACK_URL="https://$RAW_URL"
           else
              CALLBACK_URL="$RAW_URL"
           fi
-          
-          echo "Target URL: $CALLBACK_URL"
-          
+
+          echo "[INFO] Target callback URL: $CALLBACK_URL"
+
           if [ -f "${{ env.FINAL_FILE }}" ]; then
-             echo "✅ Found file: ${{ env.FINAL_FILE }}"
-             echo "Uploading..."
-             
-             # FIX 2: Added -L to follow redirects automatically
+             echo "[INFO] Found file: ${{ env.FINAL_FILE }}. Uploading to callback endpoint..."
              curl -L -X POST "$CALLBACK_URL" \
              -H "Content-Type: multipart/form-data" \
              -F "data=@${{ env.FINAL_FILE }};filename=${{ env.FINAL_FILE }}" \
              -F "folder_id=${{ github.event.client_payload.folder_id }}" \
              -F "user_email=${{ github.event.client_payload.user_email }}"
           else
-             echo "❌ CRITICAL ERROR: Output file '${{ env.FINAL_FILE }}' was NOT created."
+             echo "[ERROR] Output file '${{ env.FINAL_FILE }}' was not created."
              exit 1
           fi

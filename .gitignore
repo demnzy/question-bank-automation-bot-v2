@@ -1,0 +1,28 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated Excel workbooks & JSON maps
+*_Final.xlsx
+coords.json
+url_map.json
+image_lookup.json
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS / Tooling
+.DS_Store
+Thumbs.db
+.agents/
+.gemini/
+.antigravity/
